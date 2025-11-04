@@ -10,6 +10,7 @@ use axum::extract::ws::{
     close_code
 };
 use tracing::{info, warn};
+use tokio::time::Duration;
 
 pub struct Session {
     user_id: Option<UserId>,
@@ -153,7 +154,14 @@ impl Session {
         }
     }
 
-    pub async fn run(mut self, state: SharedState, mut rx: tokio::sync::mpsc::UnboundedReceiver<AppMessage>) {
+    pub async fn run(
+        mut self,
+        state: SharedState,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<AppMessage>
+    ) {
+        let auth_timeout = Duration::from_secs(10);
+        let mut auth_timer = Some(Box::pin(tokio::time::sleep(auth_timeout)));
+
         loop {
             tokio::select! {
                 Some(msg) = self.socket.recv() => {
@@ -161,6 +169,9 @@ impl Session {
                         Ok(Message::Text(text)) => {
                             if !self.handle_incoming_message(&state, &text).await {
                                 break;
+                            }
+                            if self.user_id.is_some() && auth_timer.is_some() {
+                                auth_timer = None;
                             }
                         },
                         Ok(Message::Close(_)) => break,
@@ -176,6 +187,17 @@ impl Session {
                     if self.socket.send(ws_msg).await.is_err() {
                         break;
                     }
+                },
+                _ = async {
+                    if let Some(timer) = &mut auth_timer {
+                        timer.await;
+                    }
+                }, if auth_timer.is_some() => {
+                    let _ = self.socket.send(Message::Close(Some(CloseFrame {
+                        code: close_code::PROTOCOL,
+                        reason: "Authentication timeout".into(),
+                    }))).await;
+                    break;
                 },
                 else => break,
             }
