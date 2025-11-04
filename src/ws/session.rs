@@ -1,6 +1,7 @@
 use crate::{
     messages::{AppMessage, ClientMessage},
     state::{SharedState, UserId, MessageSender},
+    ws::auth::{AuthChallenge, AuthError},
 };
 use axum::extract::ws::{
     CloseFrame,
@@ -18,7 +19,8 @@ enum HandleResult {
 }
 
 pub struct Session {
-    user_id: Option<UserId>,
+    client_id: Option<UserId>,
+    pending_verification: Option<AuthChallenge>,
     sender: MessageSender,
     socket: WebSocket,
 }
@@ -28,7 +30,8 @@ impl Session {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         (
             Session {
-                user_id: None,
+                client_id: None,
+                pending_verification: None,
                 sender,
                 socket,
             },
@@ -53,7 +56,7 @@ impl Session {
                                 HandleResult::Close => break,
                                 _ => (),
                             }
-                            if self.user_id.is_some() && auth_timer.is_some() {
+                            if self.client_id.is_some() && auth_timer.is_some() {
                                 auth_timer = None;
                             }
                         },
@@ -86,7 +89,7 @@ impl Session {
             }
         }
         
-        if let Some(id) = self.user_id.take() {
+        if let Some(id) = self.client_id.take() {
             state.remove(&id);
             info!("User {} disconnected", id)
         }
@@ -97,7 +100,7 @@ impl Session {
 
 impl Session {
     async fn handle_incoming_message(&mut self, state: &SharedState, text: &str) -> HandleResult {
-        if self.user_id.is_none() {
+        if self.client_id.is_none() {
             return self.handle_auth_message(state, text).await;
         }
 
@@ -108,7 +111,7 @@ impl Session {
             Ok(ClientMessage::File { to, url }) => {
                 self.handle_file_message(state, &to, &url).await
             },
-            Ok(ClientMessage::Auth { .. }) => {
+            Ok(ClientMessage::Auth { .. }) | Ok(ClientMessage::Verify { .. }) => {
                 warn!("User already authenticated");
                 HandleResult::Continue
             },
@@ -120,44 +123,76 @@ impl Session {
     }
 
     async fn handle_auth_message(&mut self, state: &SharedState, text: &str) -> HandleResult {
-        match serde_json::from_str::<ClientMessage>(text) {
-            Ok(ClientMessage::Auth { token }) => {
-                if token.is_empty() {
-                    warn!("Received empty auth token");
-                    let _ = self
-                        .socket
-                        .send(Message::Close(Some(CloseFrame {
-                            code: close_code::INVALID,
-                            reason: "Empty token".into()
-                        })))
-                        .await;
-                    return HandleResult::Close
+        if self.pending_verification.is_some() {
+            return match serde_json::from_str::<ClientMessage>(text) {
+                Ok(ClientMessage::Verify { attempt }) => {
+                    self.handle_verify(state, &attempt).await
                 }
+                _ => {
+                    let client_id = self.client_id.clone();
+                    self.send_error("expected_verify", client_id.unwrap().as_str()).await;
+                    HandleResult::Continue
+                }
+            };
+        }
 
-                self.user_id = Some(token.clone());
-                state.insert(token.clone(), self.sender.clone());
-
-                let reply = serde_json::json!({"type": "auth_ok"});
-                let _ = self
-                    .socket
-                    .send(Message::Text(Utf8Bytes::from(reply.to_string())))
-                    .await;
-                HandleResult::Continue
-            },
+        match serde_json::from_str::<ClientMessage>(text) {
+            Ok(ClientMessage::Auth { token: pubkey_bytes }) => {
+                match AuthChallenge::new(&pubkey_bytes) {
+                    Ok((auth_challenge, challenge_msg)) => {
+                        self.pending_verification = Some(auth_challenge);
+                        if self.socket.send(challenge_msg).await.is_err() {
+                            return HandleResult::Close;
+                        }
+                        HandleResult::Continue
+                    }
+                    Err(_) => {
+                        self.send_close("Invalid public key").await;
+                        HandleResult::Close
+                    }
+                }
+            }
             _ => {
-                let err = serde_json::json!({ "type": "error", "payload": { "msg": "auth_required" } });
-                let _ = self
-                    .socket
-                    .send(Message::Text(Utf8Bytes::from(err.to_string())))
-                    .await;
+                let client_id = self.client_id.clone();
+                self.send_error("auth_required", client_id.unwrap().as_str()).await;
                 HandleResult::Continue
             }
         }
     }
 
+    async fn handle_verify(&mut self, state: &SharedState, sig_bytes: &[u8]) -> HandleResult {
+        let pending = self.pending_verification.take()
+            .expect("verify called without pending");
+        
+        match pending.verify(sig_bytes) {
+            Ok(()) => {
+                let client_id = pending.client_id();
+                self.client_id = Some(client_id.clone());
+                state.insert(client_id.clone(), self.sender.clone());
+
+                let msg = serde_json::json!({ "type": "auth_ok" });
+                if self.socket.send(Message::Text(Utf8Bytes::from(msg.to_string()))).await.is_err() {
+                    return HandleResult::Close;
+                }
+                
+                info!("User authenticated: {}", client_id);
+                HandleResult::Continue
+            }
+            Err(e) => {
+                let reason = match e {
+                    AuthError::InvalidSignatureLength => "Invalid signature length",
+                    AuthError::InvalidSignatureFormat => "Invalid signature format",
+                    AuthError::VerificationFailed => "Signature verification failed",
+                    _ => "Authentication failed",
+                };
+                self.send_close(reason).await;
+                HandleResult::Close
+            }
+        }
+    }
+
     async fn handle_text_message(&mut self, state: &SharedState, to: &str, text: &str ) -> HandleResult {
-        let from = self.user_id.as_ref().unwrap(); // is called only after authorization so user_id
-                                                   // shouldn't be None
+        let from = self.client_id.as_ref().expect("called only after auth");
         if let Some(sender) = state.get(to) {
             let msg = serde_json::json!({
                 "type": "text",
@@ -166,11 +201,9 @@ impl Session {
                     "text": text,
                 }
             });
-
             if sender.send(AppMessage::Text(msg.to_string())).is_err() {
                 warn!("Failed to send message to user {}", to);
             }
-            HandleResult::Continue
         } else {
             let err = serde_json::json!({
                 "type": "error",
@@ -180,15 +213,15 @@ impl Session {
                 }
             });
             let _ = self
-                .socket
-                .send(Message::Text(Utf8Bytes::from(err.to_string())))
-                .await;
-            HandleResult::Continue
+            .socket
+            .send(Message::Text(Utf8Bytes::from(err.to_string())))
+            .await;
         }
+        HandleResult::Continue
     }
 
     async fn handle_file_message(&mut self, state: &SharedState, to: &str, url: &str) -> HandleResult {
-        let from = self.user_id.as_ref().unwrap();
+        let from = self.client_id.as_ref().unwrap();
 
         if let Some(sender) = state.get(to) {
             let msg = serde_json::json!({
@@ -202,20 +235,22 @@ impl Session {
             if sender.send(AppMessage::Text(msg.to_string())).is_err() {
                 warn!("Failed to send message to user {}", to);
             }
-            HandleResult::Continue
         } else {
-            let err = serde_json::json!({
-                "type": "error",
-                "payload": {
-                    "msg": "user_offline",
-                    "user": to
-                }
-            });
-            let _ = self
-                .socket
-                .send(Message::Text(Utf8Bytes::from(err.to_string())))
-                .await;
-            HandleResult::Continue
+            self.send_error("user_offline", to).await;
         }
+        HandleResult::Continue
+    }
+
+    async fn send_error(&mut self, msg: &str, to: &str) {
+        let err = serde_json::json!({ "type": "error", "payload": { "msg": msg, "user": to } });
+        let _ = self.socket.send(Message::Text(Utf8Bytes::from(err.to_string()))).await;
+    }
+
+    async fn send_close(&mut self, reason: &str) {
+        warn!("Closing connection: {}", reason);
+        let _ = self.socket.send(Message::Close(Some(CloseFrame {
+            code: 1008,
+            reason: Utf8Bytes::from(reason.to_string()),
+        }))).await;
     }
 }

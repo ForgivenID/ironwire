@@ -20,7 +20,10 @@ impl From<AppMessage> for WsMessage {
 #[serde(tag = "type", content = "payload")]
 pub enum ClientMessage {
     #[serde(rename = "auth")]
-    Auth { token: String },
+    Auth { token: Vec<u8> },
+
+    #[serde(rename = "verify")]
+    Verify { attempt: Vec<u8> },
 
     #[serde(rename = "text")]
     Text { to: String, text: String },
