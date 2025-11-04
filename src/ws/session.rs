@@ -36,6 +36,66 @@ impl Session {
         )
     }
 
+    pub async fn run(
+        mut self,
+        state: SharedState,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<AppMessage>
+    ) {
+        let auth_timeout = Duration::from_secs(10);
+        let mut auth_timer = Some(Box::pin(tokio::time::sleep(auth_timeout)));
+
+        loop {
+            tokio::select! {
+                Some(msg) = self.socket.recv() => {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            match self.handle_incoming_message(&state, &text).await {
+                                HandleResult::Close => break,
+                                _ => (),
+                            }
+                            if self.user_id.is_some() && auth_timer.is_some() {
+                                auth_timer = None;
+                            }
+                        },
+                        Ok(Message::Close(_)) => break,
+                        Ok(_) => {},
+                        Err(e) => {
+                            warn!("WebSocket receive error{}", e);
+                            break;
+                        }
+                    }
+                },
+                Some(app_msg) = rx.recv() => {
+                    let ws_msg: Message = app_msg.into();
+                    if self.socket.send(ws_msg).await.is_err() {
+                        break;
+                    }
+                },
+                _ = async {
+                    if let Some(timer) = &mut auth_timer {
+                        timer.await;
+                    }
+                }, if auth_timer.is_some() => {
+                    let _ = self.socket.send(Message::Close(Some(CloseFrame {
+                        code: close_code::PROTOCOL,
+                        reason: "Authentication timeout".into(),
+                    }))).await;
+                    break;
+                },
+                else => break,
+            }
+        }
+        
+        if let Some(id) = self.user_id.take() {
+            state.remove(&id);
+            info!("User {} disconnected", id)
+        }
+
+        info!("WebSocket connection closed")
+    }
+}
+
+impl Session {
     async fn handle_incoming_message(&mut self, state: &SharedState, text: &str) -> HandleResult {
         if self.user_id.is_none() {
             return self.handle_auth_message(state, text).await;
@@ -157,63 +217,5 @@ impl Session {
                 .await;
             HandleResult::Continue
         }
-    }
-
-    pub async fn run(
-        mut self,
-        state: SharedState,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<AppMessage>
-    ) {
-        let auth_timeout = Duration::from_secs(10);
-        let mut auth_timer = Some(Box::pin(tokio::time::sleep(auth_timeout)));
-
-        loop {
-            tokio::select! {
-                Some(msg) = self.socket.recv() => {
-                    match msg {
-                        Ok(Message::Text(text)) => {
-                            match self.handle_incoming_message(&state, &text).await {
-                                HandleResult::Close => break,
-                                _ => (),
-                            }
-                            if self.user_id.is_some() && auth_timer.is_some() {
-                                auth_timer = None;
-                            }
-                        },
-                        Ok(Message::Close(_)) => break,
-                        Ok(_) => {},
-                        Err(e) => {
-                            warn!("WebSocket receive error{}", e);
-                            break;
-                        }
-                    }
-                },
-                Some(app_msg) = rx.recv() => {
-                    let ws_msg: Message = app_msg.into();
-                    if self.socket.send(ws_msg).await.is_err() {
-                        break;
-                    }
-                },
-                _ = async {
-                    if let Some(timer) = &mut auth_timer {
-                        timer.await;
-                    }
-                }, if auth_timer.is_some() => {
-                    let _ = self.socket.send(Message::Close(Some(CloseFrame {
-                        code: close_code::PROTOCOL,
-                        reason: "Authentication timeout".into(),
-                    }))).await;
-                    break;
-                },
-                else => break,
-            }
-        }
-        
-        if let Some(id) = self.user_id.take() {
-            state.remove(&id);
-            info!("User {} disconnected", id)
-        }
-
-        info!("WebSocket connection closed")
     }
 }
