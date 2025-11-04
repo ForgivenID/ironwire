@@ -12,6 +12,11 @@ use axum::extract::ws::{
 use tracing::{info, warn};
 use tokio::time::Duration;
 
+enum HandleResult {
+    Continue,
+    Close
+}
+
 pub struct Session {
     user_id: Option<UserId>,
     sender: MessageSender,
@@ -31,7 +36,7 @@ impl Session {
         )
     }
 
-    async fn handle_incoming_message(&mut self, state: &SharedState, text: &str) -> bool {
+    async fn handle_incoming_message(&mut self, state: &SharedState, text: &str) -> HandleResult {
         if self.user_id.is_none() {
             return self.handle_auth_message(state, text).await;
         }
@@ -45,16 +50,16 @@ impl Session {
             },
             Ok(ClientMessage::Auth { .. }) => {
                 warn!("User already authenticated");
-                true
+                HandleResult::Continue
             },
             Err(e) => {
                 warn!("Failed to parse message: {}", e);
-                true
+                HandleResult::Continue
             },
         }
     }
 
-    async fn handle_auth_message(&mut self, state: &SharedState, text: &str) -> bool {
+    async fn handle_auth_message(&mut self, state: &SharedState, text: &str) -> HandleResult {
         match serde_json::from_str::<ClientMessage>(text) {
             Ok(ClientMessage::Auth { token }) => {
                 if token.is_empty() {
@@ -66,7 +71,7 @@ impl Session {
                             reason: "Empty token".into()
                         })))
                         .await;
-                    return false
+                    return HandleResult::Close
                 }
 
                 self.user_id = Some(token.clone());
@@ -77,7 +82,7 @@ impl Session {
                     .socket
                     .send(Message::Text(Utf8Bytes::from(reply.to_string())))
                     .await;
-                true
+                HandleResult::Continue
             },
             _ => {
                 let err = serde_json::json!({ "type": "error", "payload": { "msg": "auth_required" } });
@@ -85,12 +90,12 @@ impl Session {
                     .socket
                     .send(Message::Text(Utf8Bytes::from(err.to_string())))
                     .await;
-                true
+                HandleResult::Continue
             }
         }
     }
 
-    async fn handle_text_message(&mut self, state: &SharedState, to: &str, text: &str ) -> bool {
+    async fn handle_text_message(&mut self, state: &SharedState, to: &str, text: &str ) -> HandleResult {
         let from = self.user_id.as_ref().unwrap(); // is called only after authorization so user_id
                                                    // shouldn't be None
         if let Some(sender) = state.get(to) {
@@ -105,7 +110,7 @@ impl Session {
             if sender.send(AppMessage::Text(msg.to_string())).is_err() {
                 warn!("Failed to send message to user {}", to);
             }
-            true
+            HandleResult::Continue
         } else {
             let err = serde_json::json!({
                 "type": "error",
@@ -118,11 +123,11 @@ impl Session {
                 .socket
                 .send(Message::Text(Utf8Bytes::from(err.to_string())))
                 .await;
-            true
+            HandleResult::Continue
         }
     }
 
-    async fn handle_file_message(&mut self, state: &SharedState, to: &str, url: &str) -> bool {
+    async fn handle_file_message(&mut self, state: &SharedState, to: &str, url: &str) -> HandleResult {
         let from = self.user_id.as_ref().unwrap();
 
         if let Some(sender) = state.get(to) {
@@ -137,7 +142,7 @@ impl Session {
             if sender.send(AppMessage::Text(msg.to_string())).is_err() {
                 warn!("Failed to send message to user {}", to);
             }
-            true
+            HandleResult::Continue
         } else {
             let err = serde_json::json!({
                 "type": "error",
@@ -150,7 +155,7 @@ impl Session {
                 .socket
                 .send(Message::Text(Utf8Bytes::from(err.to_string())))
                 .await;
-            true
+            HandleResult::Continue
         }
     }
 
@@ -167,8 +172,9 @@ impl Session {
                 Some(msg) = self.socket.recv() => {
                     match msg {
                         Ok(Message::Text(text)) => {
-                            if !self.handle_incoming_message(&state, &text).await {
-                                break;
+                            match self.handle_incoming_message(&state, &text).await {
+                                HandleResult::Close => break,
+                                _ => (),
                             }
                             if self.user_id.is_some() && auth_timer.is_some() {
                                 auth_timer = None;
