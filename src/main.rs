@@ -7,7 +7,6 @@ use axum::{routing::{get, post}, Extension, Router};
 use state::SharedState;
 use tokio::net::TcpListener;
 use tracing::info;
-use tower_http::services::ServeDir;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()>{
@@ -18,7 +17,7 @@ async fn main() -> anyhow::Result<()>{
     let app = Router::new()
         .route("/ws", get(ws::handler::ws_handler))
         .route("/upload", post(http::upload::upload_handler))
-        .nest_service("/media", ServeDir::new("uploads"))
+        .route("/media/{path}", get(http::media::media_handler))
         .fallback(http::fallback::fallback_handler)
         .layer(Extension(state));
 
