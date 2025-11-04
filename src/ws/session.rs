@@ -192,7 +192,8 @@ impl Session {
     }
 
     async fn handle_text_message(&mut self, state: &SharedState, to: &str, text: &str ) -> HandleResult {
-        let from = self.client_id.as_ref().expect("called only after auth");
+        let from = self.client_id.as_ref().unwrap(); // is called only after authorization so user_id
+                                                              // shouldn't be None
         if let Some(sender) = state.get(to) {
             let msg = serde_json::json!({
                 "type": "text",
