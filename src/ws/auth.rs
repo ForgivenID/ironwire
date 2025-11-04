@@ -17,6 +17,17 @@ pub enum AuthError {
     VerificationFailed,
 }
 
+impl Into<&str> for AuthError {
+    fn into(self) -> &'static str {
+        match self {
+                AuthError::InvalidSignatureLength => "Invalid signature length",
+                AuthError::InvalidSignatureFormat => "Invalid signature format",
+                AuthError::VerificationFailed => "Signature verification failed",
+                _ => "Authentication failed",
+        }
+    }
+}
+
 impl AuthChallenge {
     pub fn new(public_key_bytes: &[u8]) -> Result<(Self, Message), AuthError> {
         if public_key_bytes.len() != PUBLIC_KEY_LENGTH {

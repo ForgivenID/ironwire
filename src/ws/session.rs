@@ -179,13 +179,7 @@ impl Session {
                 HandleResult::Continue
             }
             Err(e) => {
-                let reason = match e {
-                    AuthError::InvalidSignatureLength => "Invalid signature length",
-                    AuthError::InvalidSignatureFormat => "Invalid signature format",
-                    AuthError::VerificationFailed => "Signature verification failed",
-                    _ => "Authentication failed",
-                };
-                self.send_close(reason).await;
+                self.send_close(e.into()).await;
                 HandleResult::Close
             }
         }
@@ -214,9 +208,9 @@ impl Session {
                 }
             });
             let _ = self
-            .socket
-            .send(Message::Text(Utf8Bytes::from(err.to_string())))
-            .await;
+                .socket
+                .send(Message::Text(Utf8Bytes::from(err.to_string())))
+                .await;
         }
         HandleResult::Continue
     }
